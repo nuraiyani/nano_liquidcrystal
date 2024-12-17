@@ -2,13 +2,15 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <EEPROM.h>
-#include <PressButton.h>
+#include <Pressbutton.h>
 
 #define DISP_ITEM_ROWS 2        //number of rows usable in the display(depends on display size)
 #define DISP_CHAR_WIDTH 16      //general info about the hiw many characters in single rows
 #define PACING_MS 25            //minimum wait milisecond between executing code in menu loop
 #define FLASH_RST_CNT 30        //number of loops between switching flash state
 #define SETTING_CHKVAL 3647     //value used to manage versioning control
+#define VIBRATION_MOTOR_PIN 11      // Vibration Motor (control pin for motor driver)
+#define LED_GREEN 10
 
 // ===========================================================
 // ||                   DECLARATIONS                        ||
@@ -16,8 +18,8 @@
 
 //i/o ports allocations-----------------------------------------------------------
 const int BTN_OK = A0;
-const int BTN_BACK = A3;
-const int BTN_UP = A2;
+const int BTN_BACK = A2;
+const int BTN_UP = A3;
 const int BTN_DOWN = A1;
 const int BTN_PLUS = 6;
 const int BTN_MINUS = 7;
@@ -30,29 +32,49 @@ PressButton btnDown(BTN_DOWN);
 PressButton btnPlus(BTN_PLUS);
 PressButton btnMinus(BTN_MINUS);
 
+// Variables for button state, mode selection, and magnetic switch status
+bool systemOn = false; // Indicates whether the system is currently active
+unsigned long lastButtonPressTime = 0; // Stores the time of the last button press
+int buttonPressCount = 0; // Counts the number of button presses
+int currentMode = 0; // 0: Off, 1: Mode 1, 2: Mode 2
+unsigned long modeEndTime = 0; // Stores the end time of the current mode
+bool sensorActivated = false; // Indicates whether the magnetic sensor is activated
+unsigned long sensorActivationTime = 0; // Stores the time of the last sensor activation
+bool sterilizationPaused = false; // Indicates whether the sterilization process is paused
+unsigned long remainingTime = 0; // Stores the remaining time when sterilization is paused
+
+// Constants for mode durations and magnetic switch debounce
+const unsigned long MODE1_DURATION = 60000; // 60 seconds / 1 min
+const unsigned long MODE2_DURATION = 30000; // 20 seconds
+const unsigned long DEMO_DURATION = 5000; // 5 seconds
+const unsigned long DOUBLE_PRESS_INTERVAL = 500; // Maximum interval between button presses for double press (milliseconds)
+const unsigned long SENSOR_DEBOUNCE_DELAY = 100; // Debounce delay for the magnetic sensor (milliseconds)
+
 // MENU STRUCTURE ------------------------------------------------------------------- 
 
 enum pageType{
         MENU_ROOT,
         MENU_SUB1,
         MENU_SUB1_A,
-        MENU_SUB1_B,
+        //MENU_SUB1_B,
         MENU_SUB2,
+        MENU_SUB2_A,
+        //MENU_SUB2_B,
         MENU_SUB3,
-        MENU_SUB4,
-        MENU_SUB5,
-        MENU_SETTINGS
+        MENU_SUB3_A,
+        MENU_SETTINGS,
 };
 
 enum pageType currPage = MENU_ROOT;
 void page_MenuRoot();
 void page_MenuSub1();
 void page_MenuSub1_A();
-void page_MenuSub1_B();
+//void page_MenuSub1_B();
 void page_MenuSub2();
+void page_MenuSub2_A();
+//void page_MenuSub2_B();
 void page_MenuSub3();
-void page_MenuSub4();
-void page_MenuSub5();
+void page_MenuSub3_A();
 void page_MenuSettings();
 
 
@@ -81,8 +103,15 @@ bool menuItemPrintable(uint8_t xPos, uint8_t yPos);             //will return a 
 
 void printPointer();                                            //depending on flash state, prints or erases the current pointer in its 
 void printOffsetArrows();                                       //print the arrows to indicate if the menu extends beyond current view
-void printOnOff(boolean val);                                      //print either ON or OFF depending on the boolean state
+void printOnOff(boolean val);                                   //print either ON or OFF depending on the boolean state
 void printUint32_tAtWidth(uint32_t value, uint8_t width, char c, boolean isRight); 
+
+//FUNCTION FOR UVC LED ---------------------------------------------------------------------------------
+void activateMode();
+void deactivateSystem();
+void displaySystemReady();
+void displayPhysiotherapyComplete();
+void check_system();
 
 // SETTINGS -------------------------------------------------------------------------------------------
 
@@ -101,7 +130,7 @@ void sets_Load();                                                //loads the set
 void sets_Save();                                                 //save the values in the settings object into the EEPROM
 
 // DISPLAY
-LiquidCrystal_I2C lcd(0x27, 16, 2);     // set the LCD address to ex27 for a 20 chars and 4 line display
+LiquidCrystal_I2C lcd(0x27, 16, 2);     // set the LCD address to ex27 for a 16 chars and 2 line display
 byte chrUp[] = {0b00000,                // Arrow up custom character data
                 0b00100,
                 0b00100,
@@ -110,7 +139,7 @@ byte chrUp[] = {0b00000,                // Arrow up custom character data
                 0b11111,
                 0b11111,
                 0b00000 };
-byte chrDn[] = { 0b00000,                // Arrow down custom character data
+byte chrDn[] = {0b00000,                // Arrow down custom character data
                 0b11111,
                 0b11111,
                 0b01110,
@@ -125,14 +154,15 @@ byte chrF1[] = {0b10000,                // Menu title left side custom character
                 0b01000,
                 0b10000,
                 0b00000 };
-byte chrF2[] = {0b00001,                // Menu title right side custom character data
-                0b00010,
-                0b00101,
-                0b01010,
-                0b00101,
-                0b00010,
-                0b00001,
-                0b00000 };
+byte chrF2[] = {                // Menu title right side custom character data
+                0b01000,
+                0b01100,
+                0b01110,
+                0b01111,
+                0b01111,
+                0b01110,
+                0b01100,
+                0b01000 };
 byte chrAr[] = {0b00000,                // Selected item pointer custom character data
                 0b01100,
                 0b11110,
@@ -147,43 +177,54 @@ byte chrAr[] = {0b00000,                // Selected item pointer custom characte
 //============================================================
 void setup() {
 
-        lcd.init();
-        lcd.createChar(1, chrUp);
-        lcd.createChar(1, chrDn);
-        lcd.createChar(1, chrF1);
-        lcd.createChar(1, chrF2);
-        lcd.createChar(1, chrAr);
+    lcd.init();
+    lcd.createChar(1, chrUp);
+    lcd.createChar(1, chrDn);
+    lcd.createChar(1, chrF1);
+    lcd.createChar(1, chrF2);
+    lcd.createChar(1, chrAr);
 
-        lcd.backlight();
+    lcd.backlight();
 
-        lcd.clear();
-        sets_Load();
+    lcd.clear();
+    sets_Load();
+        
+    // Pin Mode Configuration
+    pinMode(VIBRATION_MOTOR_PIN, OUTPUT);
+    pinMode(LED_GREEN, OUTPUT);
+    pinMode(BTN_OK, INPUT_PULLUP); // Using internal pull-up resistor for the button
 
+    // Initialize all outputs to LOW
+    digitalWrite(VIBRATION_MOTOR_PIN, LOW);
+    digitalWrite(LED_GREEN, LOW);
 }
 // ===========================================================
 // ||                  MAIN LOOP                            ||
 //============================================================
 void loop() {
-        switch(currPage){
-        case MENU_ROOT : page_MenuRoot();break;
-        case MENU_SUB1 : page_MenuSub1();break;
-        case MENU_SUB1_A : page_MenuSub1_A();break;
-        case MENU_SUB1_B : page_MenuSub1_B();break;
-        case MENU_SUB2 : page_MenuSub2();break;
-        case MENU_SUB3 : page_MenuSub3();break;
-        case MENU_SUB4 : page_MenuSub4();break;
-        case MENU_SUB5 : page_MenuSub5();break;
-        case MENU_SETTINGS : page_MenuSettings();break;
 
-        }
-}
+                switch(currPage){
+                case MENU_ROOT : page_MenuRoot();break;
+                case MENU_SUB1 : page_MenuSub1();break;
+                case MENU_SUB1_A : page_MenuSub1_A();break;
+                //case MENU_SUB1_B : page_MenuSub1_B();break;
+                case MENU_SUB2 : page_MenuSub2();break;
+                case MENU_SUB2_A : page_MenuSub2_A();break;
+                //case MENU_SUB2_B : page_MenuSub2_B();break;
+                case MENU_SUB3 : page_MenuSub3();break;
+                case MENU_SUB3_A : page_MenuSub3_A();break;
+                case MENU_SETTINGS : page_MenuSettings();break;
+                }
+                
+  }
+
 // ===========================================================
 // ||                  MENU ROOT                            ||
 //============================================================
 void page_MenuRoot(){
 
         //initializes menu pages
-        initMenuPages(F("MAIN MENU"), 6 );
+        initMenuPages(F("MAIN MENU"), 5);
 
         // for the ROOT MENU we will recall last know position and off set of the display
         pntrPos = root_pntrPos; dispOffset = root_dispOffSet; 
@@ -195,18 +236,16 @@ void page_MenuRoot(){
                 if(updateAllitems){
 
                         //print the visible item
-                        if(menuItemPrintable(1,1)){lcd.print(F("Sub Menu #1"));}
-                        if(menuItemPrintable(1,2)){lcd.print(F("Sub Menu #2"));}
-                        if(menuItemPrintable(1,3)){lcd.print(F("Sub Menu #3"));}
-                        if(menuItemPrintable(1,4)){lcd.print(F("Sub Menu #4"));}
-                        if(menuItemPrintable(1,5)){lcd.print(F("Settings   "));}
+                        if(menuItemPrintable(1,1)){lcd.print(F("MODE 1     "));}
+                        if(menuItemPrintable(1,2)){lcd.print(F("MODE 2     "));}
+                        if(menuItemPrintable(1,3)){lcd.print(F("DEMO MODE  "));}
+                        if(menuItemPrintable(1,4)){lcd.print(F("SETTINGS   "));}
 
-                        printOffsetArrows();
                 }
         
                 if(isFlashChanged()){printPointer();}
 
-                //alwats clear update flags by this point
+                //always clear update flags by this point
                 updateAllitems = false;
 
                 //capture the button down state
@@ -221,8 +260,7 @@ void page_MenuRoot(){
                                 case 1: currPage = MENU_SUB1; return;
                                 case 2: currPage = MENU_SUB2; return;
                                 case 3: currPage = MENU_SUB3; return;
-                                case 4: currPage = MENU_SUB4; return;
-                                case 5: currPage = MENU_SETTINGS; return;
+                                case 4: currPage = MENU_SETTINGS; return;
                         }
                 }
                 
@@ -234,13 +272,13 @@ void page_MenuRoot(){
         }  
 }
 // ===========================================================
-// ||                  MENU SUB#1                            ||
+// ||                  MODE 1                               ||
 //============================================================
 void page_MenuSub1(){
 
         //initializes menu pages
-        initMenuPages(F("SUB MENU 1"), 3 );
-
+        initMenuPages(F("CONTINUOUS "), 3 );
+        
         //inner loop
         while (true){
 
@@ -248,15 +286,14 @@ void page_MenuSub1(){
                 if(updateAllitems){
 
                         //print the visible item
-                        if(menuItemPrintable(1,1)){lcd.print(F("Sub Menu #1_A"));}
-                        if(menuItemPrintable(1,2)){lcd.print(F("Sub Menu #1_B"));}
+                        if(menuItemPrintable(1,1)){lcd.print(F("START "));}
+                        if(menuItemPrintable(1,2)){lcd.print(F("BACK  "));}
 
-                        printOffsetArrows();
                 }
         
                 if(isFlashChanged()){printPointer();}
 
-                //alwats clear update flags by this point
+                //always clear update flags by this point
                 updateAllitems = false;
 
                 //capture the button down state
@@ -267,7 +304,7 @@ void page_MenuSub1(){
 
                         switch (pntrPos){
                                 case 1: currPage = MENU_SUB1_A; return;
-                                case 2: currPage = MENU_SUB1_B; return;
+                                case 2: currPage = MENU_ROOT; return;
                         }
                 }
                 else if(btnBack.PressReleased()){
@@ -283,28 +320,65 @@ void page_MenuSub1(){
         }  
 }
 // ===========================================================
-// ||                  MENU SUB#1_A                            ||
+// ||                  SUB MODE 1                         ||
 //============================================================
 void page_MenuSub1_A(){
 
         //initializes menu pages
-        initMenuPages(F("SUB MENU 1_A"), 2 );
+        initMenuPages(F("CONTINUOUS"), 2 );
 
         //inner loop
         while (true){
 
-                //print the sipalay item when requested
+                //print the Display item when requested
                 if(updateAllitems){
 
                         //print the visible item
-                        if(menuItemPrintable(1,1)){lcd.print(F("NO ITEM"));}
+                        if(menuItemPrintable(1,1)){
+                                
+                                if (systemOn) 
+                                {
+                                        // If system is on, stop sterilization
+                                        sterilizationPaused = true;
+                                        systemOn = false;
+                                        remainingTime = modeEndTime - millis();
+                                        lcd.clear();
+                                        lcd.setCursor(0, 0);
+                                        lcd.print(F("System Interrupt"));
+                                        lcd.setCursor(1, 1);
+                                        lcd.print(F(" Press Back >>"));                                        
+                                        digitalWrite(VIBRATION_MOTOR_PIN, LOW);
+                                        digitalWrite(LED_GREEN, LOW);
+                                }
+                                else {
+                                        // If paused, resume sterilization
+                                        if (sterilizationPaused) {
+                                                modeEndTime = millis() + remainingTime;
+                                                systemOn = true;
+                                                sterilizationPaused = false;
+                                                lcd.setCursor(1, 1);
+                                                lcd.print(" 00 : ");
+                                                lcd.print(remainingTime / 1000); // Print remaining seconds on LCD
+                                                lcd.print(" : 00   ");
+                                                digitalWrite(VIBRATION_MOTOR_PIN, HIGH); // Activate Vibration Motor
+                                                digitalWrite(LED_GREEN, HIGH); //Activate Green LED
+                                                } 
+                                        else {
+                                                currentMode = 1;// Mode 1 selected
+                                                modeEndTime = millis() + MODE1_DURATION;
+                                                activateMode();           
+                                        }
+                                }
 
-                        printOffsetArrows();
+                        }
                 }
-        
+
+                //check system on and update countdown
+                check_system();
+
                 if(isFlashChanged()){printPointer();}
 
-                //alwats clear update flags by this point
+                //always clear update flags by this point
                 updateAllitems = false;
 
                 //capture the button down state
@@ -317,45 +391,9 @@ void page_MenuSub1_A(){
 
                 //keep a specific pace
                 pacingWait();
-        }  
-}
-// ===========================================================
-// ||                  MENU SUB#1_B                            ||
-//============================================================
 
-void page_MenuSub1_B(){
-       
-        //initializes menu pages
-        initMenuPages(F("SUB MENU 1_B"), 2 );
-
-        //inner loop
-        while (true){
-
-                //print the sipalay item when requested
-                if(updateAllitems){
-
-                        //print the visible item
-                        if(menuItemPrintable(1,1)){lcd.print(F("NO ITEM"));}
-
-                        printOffsetArrows();
-                }
-        
-                if(isFlashChanged()){printPointer();}
-
-                //alwats clear update flags by this point
-                updateAllitems = false;
-
-                //capture the button down state
-                captureButtonDownState();
-
-                //check for the ok button
-                if (btnBack.PressReleased()){currPage = MENU_SUB1; return;}
-                //otherwise check for pointer up or down button
-                doPointerNavigation();
-
-                //keep a specific pace
-                pacingWait();
-        }  
+  
+        }
 }
 // ===========================================================
 // ||                  MENU SUB#2                            ||
@@ -364,7 +402,7 @@ void page_MenuSub1_B(){
 void page_MenuSub2(){
         
         //initializes menu pages
-        initMenuPages(F("SUB MENU 2"), 3 );
+        initMenuPages(F("INTERMITTENT"), 3 );
 
         //inner loop
         while (true){
@@ -373,10 +411,9 @@ void page_MenuSub2(){
                 if(updateAllitems){
 
                         //print the visible item
-                        if(menuItemPrintable(1,1)){lcd.print(F("Something one"));}
-                        if(menuItemPrintable(1,2)){lcd.print(F("Something two"));}
+                        if(menuItemPrintable(1,1)){lcd.print(F("START  "));}
+                        if(menuItemPrintable(1,2)){lcd.print(F("BACK   "));}
 
-                        printOffsetArrows();
                 }
         
                 if(isFlashChanged()){printPointer();}
@@ -387,8 +424,19 @@ void page_MenuSub2(){
                 //capture the button down state
                 captureButtonDownState();
 
-                if(btnBack.PressReleased()){currPage = MENU_ROOT; return;}
-                
+                //check for the ok button
+                if(btnOk.PressReleased()){
+
+                        switch (pntrPos){
+                                case 1: currPage = MENU_SUB2_A; return;
+                                case 2: currPage = MENU_ROOT; return;
+                        }
+                }
+                else if(btnBack.PressReleased()){
+
+                        switch (pntrPos){case 1: currPage = MENU_ROOT; return;
+                        }
+                }
                 //otherwise check for pointer up or down button
                 doPointerNavigation();
 
@@ -397,13 +445,85 @@ void page_MenuSub2(){
         }  
 }
 // ===========================================================
-// ||                  MENU SUB#3                            ||
+// ||                  SUB MODE 2                         ||
+//============================================================
+void page_MenuSub2_A(){
+
+        //initializes menu pages
+        initMenuPages(F("INTERMITTENT"), 2 );
+
+        //inner loop
+        while (true){
+
+                //print the sipalay item when requested
+                if(updateAllitems){
+
+                        if(menuItemPrintable(1,1)){
+                                
+                                if (systemOn) {
+                                        // If system is on, stop sterilization
+                                        sterilizationPaused = true;
+                                        systemOn = false;
+                                        remainingTime = modeEndTime - millis();
+                                        lcd.clear();
+                                        lcd.setCursor(0, 0);
+                                        lcd.print(F("System Interrupt"));
+                                        lcd.setCursor(1, 1);
+                                        lcd.print(F(" Press Back >>"));                                        
+                                        digitalWrite(VIBRATION_MOTOR_PIN, LOW);
+                                        digitalWrite(LED_GREEN, LOW);
+                                }
+                                else {
+                                        // If paused, resume sterilization
+                                        if (sterilizationPaused) {
+                                                modeEndTime = millis() + remainingTime;
+                                                systemOn = true;
+                                                sterilizationPaused = false;
+                                                lcd.setCursor(1, 1);
+                                                lcd.print(" 00 : ");
+                                                lcd.print(remainingTime / 1000); // Print remaining seconds on LCD
+                                                lcd.print(" : 00   ");
+                                                digitalWrite(VIBRATION_MOTOR_PIN, HIGH); // Activate Vibration Motor
+                                                digitalWrite(LED_GREEN, HIGH); // Activate LED Green
+                                                } 
+                                        else {
+                                                currentMode = 2;// Mode 2 selected
+                                                modeEndTime = millis() + MODE2_DURATION;
+                                                activateMode();           
+                                                }
+                                        }
+                                }
+                }
+
+                //check system on and update countdown
+                check_system();
+        
+                if(isFlashChanged()){printPointer();}
+
+                //alwats clear update flags by this point
+                updateAllitems = false;
+
+                //capture the button down state
+                captureButtonDownState();
+
+                //check for the ok button
+                if (btnBack.PressReleased()){currPage = MENU_SUB2; return;}
+                //otherwise check for pointer up or down button
+                doPointerNavigation();
+
+                //keep a specific pace
+                pacingWait();                 
+        }
+}
+
+// ===========================================================
+// ||                  DEMO MODE                            ||
 //============================================================
 
 void page_MenuSub3(){
         
        //initializes menu pages
-        initMenuPages(F("SUB MENU 3"), 3 );
+        initMenuPages(F("DEMO MODE"), 3 );
 
         //inner loop
         while (true){
@@ -412,10 +532,9 @@ void page_MenuSub3(){
                 if(updateAllitems){
 
                         //print the visible item
-                        if(menuItemPrintable(1,1)){lcd.print(F("Something one"));}
-                        if(menuItemPrintable(1,2)){lcd.print(F("Something two"));}
+                        if(menuItemPrintable(1,1)){lcd.print(F("START  "));}
+                        if(menuItemPrintable(1,2)){lcd.print(F("BACK   "));}
 
-                        printOffsetArrows();
                 }
         
                 if(isFlashChanged()){printPointer();}
@@ -426,23 +545,30 @@ void page_MenuSub3(){
                 //capture the button down state
                 captureButtonDownState();
 
-                if(btnBack.PressReleased()){currPage = MENU_ROOT; return;}
+                                //check for the ok button
+                if(btnOk.PressReleased()){
+
+                        switch (pntrPos){
+                                case 1: currPage = MENU_SUB3_A; return;
+                                case 2: currPage = MENU_ROOT; return;
+                        }
+                }
+                else if(btnBack.PressReleased()){currPage = MENU_ROOT; return;}
                 
                 //otherwise check for pointer up or down button
                 doPointerNavigation();
 
                 //keep a specific pace
                 pacingWait();
-        }  
+        } 
 }
 // ===========================================================
-// ||                  MENU SUB#4                            ||
+// ||                  SUB DEMO MODE                          ||
 //============================================================
+void page_MenuSub3_A(){
 
-void page_MenuSub4(){
-        
         //initializes menu pages
-        initMenuPages(F("SUB MENU 4"), 3 );
+        initMenuPages(F("DEMO MODE"), 2 );
 
         //inner loop
         while (true){
@@ -451,22 +577,57 @@ void page_MenuSub4(){
                 if(updateAllitems){
 
                         //print the visible item
-                        if(menuItemPrintable(1,1)){lcd.print(F("Something one"));}
-                        if(menuItemPrintable(1,2)){lcd.print(F("Something two"));}
+                        if(menuItemPrintable(1,1)){
+                                
+                                if (systemOn) {
+                                        // If system is on, stop sterilization
+                                        sterilizationPaused = true;
+                                        systemOn = false;
+                                        remainingTime = modeEndTime - millis();
+                                        lcd.clear();
+                                        lcd.setCursor(0, 0);
+                                        lcd.print(F("System Interrupt"));
+                                        lcd.setCursor(1, 1);
+                                        lcd.print(F(" Press Back >>"));                                        
+                                        digitalWrite(VIBRATION_MOTOR_PIN, LOW);
+                                        digitalWrite(LED_GREEN, LOW);
+                                        }
+                                else {
+                                        // If paused, resume sterilization
+                                        if (sterilizationPaused) {
+                                                modeEndTime = millis() + remainingTime;
+                                                systemOn = true;
+                                                sterilizationPaused = false;
+                                                lcd.setCursor(1, 1);
+                                                lcd.print(" 00 : ");
+                                                lcd.print(remainingTime / 1000); // Print remaining seconds on LCD
+                                                lcd.print(" : 00   ");
+                                                digitalWrite(VIBRATION_MOTOR_PIN, HIGH); // Activate Vibration Motor
+                                                digitalWrite(LED_GREEN, HIGH); // Activate LED Green
+                                                } 
+                                        else {
+                                                currentMode = 3;// Mode 1 selected
+                                                modeEndTime = millis() + DEMO_DURATION;
+                                                activateMode();           
+                                        }
+                                }
 
-                        printOffsetArrows();
+                        }
                 }
-        
+
+                //check system on and update countdown
+                check_system();
+
                 if(isFlashChanged()){printPointer();}
 
-                //alwats clear update flags by this point
+                //always clear update flags by this point
                 updateAllitems = false;
 
                 //capture the button down state
                 captureButtonDownState();
 
-                if(btnBack.PressReleased()){currPage = MENU_ROOT; return;}
-                
+                //check for the ok button
+                if (btnBack.PressReleased()){currPage = MENU_SUB3; return;}
                 //otherwise check for pointer up or down button
                 doPointerNavigation();
 
@@ -474,12 +635,7 @@ void page_MenuSub4(){
                 pacingWait();
         }  
 }
-// ===========================================================
-// ||                  MENU SUB#5                            ||
-//============================================================
-void page_MenuSub5(){
-        while (true){}
-}
+
 // ===========================================================
 // ||                  MENU settings                            ||
 //============================================================
@@ -501,7 +657,6 @@ void page_MenuSettings(){
                         if(menuItemPrintable(1,5)){lcd.print(F("Setting 5 = "));}
                         if(menuItemPrintable(1,6)){lcd.print(F("Setting 6 = "));}
 
-                        printOffsetArrows();
                 }
                 if(updateAllitems || updateItemvalue){
 
@@ -546,6 +701,69 @@ void page_MenuSettings(){
 }
 
 // ===========================================================
+// ||                  MENU UVC                            ||
+//============================================================
+
+// Function to activate the selected mode
+void activateMode() {
+
+        systemOn = true; // Turn on the system
+        sterilizationPaused = false;
+        
+        lcd.setCursor(1, 1);
+        lcd.print("MODE ");
+        lcd.print(currentMode);
+        lcd.print(": ");
+        lcd.print((modeEndTime - millis()) / 1000); // Print initial remaining seconds on LCD
+        lcd.print("s   ");
+        digitalWrite(VIBRATION_MOTOR_PIN, HIGH); // Activate UV-C lights
+        digitalWrite(LED_GREEN, HIGH); //Activate LED Green
+}
+
+// Function to display "Sterilization Complete" on the LCD
+void displayPhysiotherapyComplete() {
+        lcd.clear();
+        lcd.setCursor(1, 0);
+        lcd.print("Physiotherapy");
+        lcd.setCursor(4, 1);
+        lcd.print("Complete");
+        delay(1000);
+        lcd.clear();
+        lcd.setCursor(3, 1);
+        lcd.print("Press Back >>");
+}
+// Function to deactivate the system
+void deactivateSystem() {
+        systemOn = false; // Turn off the system
+        currentMode = 0; // Reset mode to Off
+        digitalWrite(VIBRATION_MOTOR_PIN, LOW);
+        digitalWrite(LED_GREEN, LOW);
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print("________________");
+        delay(1000);
+}
+void check_system(){
+
+        // Update the countdown display for Mode 1
+        if (systemOn && (currentMode == 1 || currentMode == 2 || currentMode == 3) ) {
+        unsigned long currentTime = millis();
+                if (currentTime >= modeEndTime) {
+                deactivateSystem();
+                displayPhysiotherapyComplete();
+        } 
+        else {
+                lcd.setCursor(1, 1);
+                lcd.print(" 00 : ");
+                //lcd.print(currentMode);
+                //lcd.print(": ");
+                lcd.print((modeEndTime - currentTime) / 1000); // Print remaining seconds on LCD
+                lcd.print(" : 00   ");
+                }
+        }
+}
+
+// ===========================================================
 // ||               TOOLS - MENU INTERVALS                  ||
 //============================================================
 
@@ -562,12 +780,12 @@ void initMenuPages(String title, uint8_t itemCount ){
         if(fillCnt > 0){for(uint8_t i = 0; i < fillCnt; i++){lcd.print(F("\04"));}}
 
         //clear all button states
-        btnUp.CleasWasDown();
-        btnDown.CleasWasDown();
-        btnOk.CleasWasDown();
-        btnBack.CleasWasDown();
-        btnPlus.CleasWasDown();
-        btnMinus.CleasWasDown();
+        btnUp.ClearWasDown();
+        btnDown.ClearWasDown();
+        btnOk.ClearWasDown();
+        btnBack.ClearWasDown();
+        btnPlus.ClearWasDown();
+        btnMinus.ClearWasDown();
 
         //set the menu item count
         itemCnt = itemCount;
@@ -693,7 +911,7 @@ void printPointer(){
         lcd.setCursor(0, pntrPos- dispOffset);
 
         //show the pointer if set
-        if(flashIsOn){lcd.print(F("\05"));}
+        if(flashIsOn){lcd.print(F("\01"));}
 
         //otherwise hide the pointer
         else{lcd.print(F(" "));}
@@ -738,7 +956,6 @@ uint8_t getUint32_tCharCnt(uint32_t value){
         //return the result!
         return cnt;
 }
-
 void printUint32_tAtWidth(uint32_t value, uint8_t width, char c, boolean isRight){
 
         uint8_t numChars = getUint32_tCharCnt(value);
@@ -770,5 +987,5 @@ void sets_Load(){
 }
 // save the values in the settings object into the EEPROM
 void sets_Save(){
-        EEPROM.put(0,settings);
+    EEPROM.put(0, settings);
 }
